@@ -11,10 +11,6 @@ const PI2 = Math.PI * 2;
 //     return obj ? {v:v, s:s, l:l, a:a} : `hsl(${v},${s}%, ${l}%, ${a})`
 // }
 
-function sleep(s = 0.1) {
-  return new Promise((resolve) => setTimeout(resolve, s * 1000));
-}
-
 async function sleeping(s = 0.1) {
   _pause = true;
   await sleep(s);
@@ -29,33 +25,9 @@ window.addEventListener("keydown", (ev) => {
   }
 });
 
-function range(n) {
-  return [...new Array(n)].map((i, idx) => idx);
-}
-
-const { floor, hypot } = Math;
 
 function toFixed(n, s = 3) {
   return +n.toFixed(s);
-}
-
-function randstr(length = 1) {
-  return alphabet.randomRange(length).join("");
-}
-
-function randint(a = 1, b = 0, rounded = true) {
-  const n = b
-    ? Math.random() * (b - a + 1) + a
-    : Math.random() * (a - b + 1) + b;
-  return rounded ? floor(n) : n;
-}
-
-function randfloat(a = 1, b = 0, fixed = 3) {
-  return toFixed(
-    b ? Math.random() * (b - a + 1) + a : Math.random() * (a - b + 1) + b,
-    fixed
-  );
-  // return toFixed(b ? a + Math.random() * (b * 2) : Math.random() * a, fixed)
 }
 function randbool() {
   return [true, false][randint()];
@@ -108,12 +80,12 @@ function coords(x, y) {
   return `${x};${y}`;
 }
 
-function overCount(i, max) {
-  while (i > max) {
-    i -= max;
-  }
-  return i;
-}
+// function overCount(i, max) {
+//   while (i > max) {
+//     i -= max;
+//   }
+//   return i;
+// }
 
 function vectorFromCoords(angle, dis) {
   return {
@@ -159,6 +131,7 @@ const {
   round,
   ceil,
   abs,
+  floor, hypot 
 } = Math;
 
 const degRad = (i) => i * (PI / 180);
@@ -625,10 +598,6 @@ function rotateVector(x, y, angle, rad = 1, isDeg = false) {
   };
 }
 
-function toFixed(nr, amt = 3) {
-  return +nr.toFixed(amt);
-}
-
 function numMax(n, max) {
   return n > max ? max : n;
 }
@@ -909,16 +878,7 @@ function randfloat(a = 1, b = 0, fixed = 3) {
   );
   // return toFixed(b ? a + Math.random() * (b * 2) : Math.random() * a, fixed)
 }
-function randbool() {
-  return [true, false][randint()];
-}
 
-function mapsHave(a, b) {
-  for (const [key, value] of Object.entries(a)) {
-    if (b.has(key)) return b.get(key);
-  }
-  return false;
-}
 
 function glob(s) {
   return str(s).replace(/(\/)/g, "_");
