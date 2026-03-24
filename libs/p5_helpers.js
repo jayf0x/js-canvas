@@ -58,15 +58,6 @@ Array.prototype.chunk = function (size = 2) {
   return res;
 };
 
-function distanceTo(src, targ, signel = true) {
-  if (signel) return toFixed(hypot(targ.x - src.x, targ.y - src.y), 3);
-  const dx = targ.x - src.x;
-  const dy = targ.y - src.y;
-  return {
-    x: dx,
-    y: dy,
-  };
-}
 
 JSON.copy = function copy(n) {
   return JSON.parse(JSON.stringify(n));
@@ -178,7 +169,7 @@ const hexTable = Object.freeze({
   0: "0",
 });
 
-alphabet = [
+const alphabet = [
   "a",
   "b",
   "c",
@@ -487,9 +478,7 @@ String.prototype.hexDecode = function () {
   return res;
 };
 
-JSON.copy = function copy(n) {
-  return JSON.parse(JSON.stringify(n));
-};
+
 
 // String.prototype.toBin8 = function() {
 //     return this
@@ -880,10 +869,6 @@ function randfloat(a = 1, b = 0, fixed = 3) {
 }
 
 
-function glob(s) {
-  return str(s).replace(/(\/)/g, "_");
-}
-
 function timer(func, iterations = 10, time = 1000) {
   const n = str(new Date().getTime());
   for (let i = 0; i < iterations; i += 1) {
@@ -948,15 +933,6 @@ function posTowards(src, targ, dis = 1) {
     z: dis * phi,
     a: angle,
   };
-}
-
-function inRange(a, b, rang = 10, neg, try2) {
-  for (let i = neg ? -rang : 0; i <= rang; i += 1) {
-    if (round(a + i) === round(b)) {
-      return i;
-    }
-  }
-  return try2 ? false : inRange(b, a, rang, neg, true);
 }
 
 function closeTo(a, b, r) {
