@@ -186,6 +186,7 @@ const pathTo = (distance = 0, name = "assets") => {
  * Some functions are made for a single usage, so might have wierd names or purposes
  * */
 
+
 const cnv =
   document.getElementById("canvas_01") ||
   document.querySelector("canvas") ||
@@ -435,23 +436,7 @@ function ellipse(
     ctx.stroke();
   }
 }
-/**
- * Draws a rounded rectangle using the current state of the canvas.
- * If you omit the last three params, it will draw a rectangle
- * outline with a 5 pixel border radius
- * @param {Number} x The top left x coordinate
- * @param {Number} y The top left y coordinate
- * @param {Number} width The width of the rectangle
- * @param {Number} height The height of the rectangle
- * @param {Number} [radius = 5] The corner radius; It can also be an object
- *                 to specify different radii for corners
- * @param {Number} [radius.tl = 0] Top left
- * @param {Number} [radius.tr = 0] Top right
- * @param {Number} [radius.br = 0] Bottom right
- * @param {Number} [radius.bl = 0] Bottom left
- * @param {Boolean} [fill = false] Whether to fill the rectangle.
- * @param {Boolean} [stroke = true] Whether to stroke the rectangle.
- */
+
 function rectRounded(
   x,
   y,
@@ -1197,10 +1182,10 @@ function numMax(n, max) {
   return n > max ? max : n;
 }
 
-function range(n = 1, detail = 1) {
+function range(n = 1, step = 1) {
   if (n < 0) return nRange(n);
   let res = [];
-  for (let i = n < 0 ? n : 0; i < n; i += detail) {
+  for (let i = n < 0 ? n : 0; i < n; i += step) {
     res.push(+i);
   }
   return res;
@@ -2068,12 +2053,11 @@ function strToBin(txt, format = 8) {
 
 // copies to clipboard
 function copyToClipboard(text) {
+  if(!document.queryCommandSupported('copy')) {
+    throw new Error("Copy action either depricated or not allowed via `document.queryCommandSupported('copy')`.")
+  }
   let dummy = document.createElement("textarea");
-  // to avoid breaking orgain page when copying more words
-  // cant copy when adding below this code
-  // dummy.style.display = 'none'
   document.body.appendChild(dummy);
-  //Be careful if you use texarea. setAttribute('value', value), which works with "input" does not work with "textarea". – Eduard
   dummy.value = text;
   dummy.select();
   document.execCommand("copy");

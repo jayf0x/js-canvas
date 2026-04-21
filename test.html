@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fluid Tree — POC</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #label {
+    position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+    color: rgba(255,255,255,0.3); font: 11px/1 monospace; letter-spacing: 0.12em;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="label">FLUID TREE — POC</div>
+
+<script>
+'use strict';
+
+// ─── CANVAS SETUP ────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+canvas.width  = canvas.clientWidth  || window.innerWidth;
+canvas.height = canvas.clientHeight || window.innerHeight;
+const W = canvas.width;
+const H = canvas.height;
+const SW = W >> 1;   // simulation grid is half-res for speed
+const SH = H >> 1;
+
+// ─── WEBGL2 ──────────────────────────────────────────────────────────────────
+const gl = canvas.getContext('webgl2', { alpha: false, antialias: false });
+if (!gl) { document.body.innerHTML = '<p style="color:#fff;padding:2rem">WebGL2 not supported</p>'; }
+
+// Enable float textures for rendering
+const extColorBufferFloat = gl.getExtension('EXT_color_buffer_float');
+if (!extColorBufferFloat) console.warn('EXT_color_buffer_float not supported; using standard formats');
+
+// ─── SHADERS ─────────────────────────────────────────────────────────────────
+
+// Shared vertex shader — outputs UV and 4-neighbours for finite-difference stencils
+const VS = `#version 300 es
+layout(location=0) in vec2 aPos;
+out vec2 vUv, vL, vR, vT, vB;
+uniform vec2 uTexel;
+void main() {
+  vUv = aPos * 0.5 + 0.5;
+  vL  = vUv - vec2(uTexel.x, 0.0);
+  vR  = vUv + vec2(uTexel.x, 0.0);
+  vT  = vUv + vec2(0.0, uTexel.y);
+  vB  = vUv - vec2(0.0, uTexel.y);
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}`;
+
+// Semi-Lagrangian advection: trace back along velocity and sample source
+const FS_ADVECT = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uVel, uSrc;
+uniform vec2 uTexel;
+uniform float uDt, uDiss;
+out vec4 fragColor;
+void main() {
+  vec2 back = vUv - uDt * texture(uVel, vUv).xy * uTexel;
+  fragColor  = uDiss * texture(uSrc, clamp(back, vec2(0.001), vec2(0.999)));
+}`;
+
+// Divergence: how much fluid is being "created" or "destroyed" at each cell
+const FS_DIV = `#version 300 es
+precision highp float;
+in vec2 vL, vR, vT, vB;
+uniform sampler2D uVel;
+out vec4 fragColor;
+void main() {
+  float L = texture(uVel, vL).x;
+  float R = texture(uVel, vR).x;
+  float T = texture(uVel, vT).y;
+  float B = texture(uVel, vB).y;
+  fragColor = vec4(0.5*(R-L + T-B), 0.0, 0.0, 1.0);
+}`;
+
+// Jacobi pressure solve: spread pressure to make the field divergence-free
+const FS_PRESSURE = `#version 300 es
+precision highp float;
+in vec2 vUv, vL, vR, vT, vB;
+uniform sampler2D uPressure, uDiv;
+out vec4 fragColor;
+void main() {
+  float L = texture(uPressure, vL).x;
+  float R = texture(uPressure, vR).x;
+  float T = texture(uPressure, vT).x;
+  float B = texture(uPressure, vB).x;
+  float d = texture(uDiv, vUv).x;
+  fragColor = vec4((L+R+T+B - d) * 0.25, 0.0, 0.0, 1.0);
+}`;
+
+// Gradient subtract: correct velocity using pressure gradient so ∇·v ≈ 0
+const FS_GRAD = `#version 300 es
+precision highp float;
+in vec2 vUv, vL, vR, vT, vB;
+uniform sampler2D uPressure, uVel;
+out vec4 fragColor;
+void main() {
+  float L = texture(uPressure, vL).x;
+  float R = texture(uPressure, vR).x;
+  float T = texture(uPressure, vT).x;
+  float B = texture(uPressure, vB).x;
+  vec2  v = texture(uVel, vUv).xy - vec2(R-L, T-B);
+  fragColor = vec4(v, 0.0, 1.0);
+}`;
+
+// Gaussian splat: inject velocity or density at a point
+const FS_SPLAT = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uTarget;
+uniform vec2  uPoint;
+uniform vec3  uColor;
+uniform float uRadius, uAspect;
+out vec4 fragColor;
+void main() {
+  vec2  p = vUv - uPoint;
+  p.x     *= uAspect;
+  float d  = exp(-dot(p,p) / uRadius);
+  fragColor = vec4(texture(uTarget, vUv).xyz + d * uColor, 1.0);
+}`;
+
+// Display: composite fluid density over the tree background with
+// refraction (the fluid bends what you see underneath) and a specular highlight.
+// Key: mix weight is capped at 0.72 so the tree is always partially visible.
+const FS_DISPLAY = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uDensity, uBg;
+uniform vec2 uTexel;
+out vec4 fragColor;
+
+void main() {
+  float den = clamp(texture(uDensity, vUv).r, 0.0, 1.0);
+
+  // Finite-difference surface normal from density field
+  float dL = texture(uDensity, vUv - vec2(uTexel.x*2.5, 0.0)).r;
+  float dR = texture(uDensity, vUv + vec2(uTexel.x*2.5, 0.0)).r;
+  float dT = texture(uDensity, vUv + vec2(0.0, uTexel.y*2.5)).r;
+  float dB = texture(uDensity, vUv - vec2(0.0, uTexel.y*2.5)).r;
+  vec3  N  = normalize(vec3(dL-dR, dB-dT, 0.18));
+
+  // Optical refraction: the fluid bends the tree image below it
+  vec2 refrUv = vUv + N.xy * 0.20 * den;
+  refrUv = clamp(refrUv, vec2(0.001), vec2(0.999));
+  vec3 bg = texture(uBg, refrUv).rgb;
+
+  // Blinn-Phong specular highlight on the fluid surface
+  vec3  L    = normalize(vec3(0.6, 1.0, 0.7));
+  vec3  H    = normalize(L + vec3(0.0, 0.0, 1.0));
+  float spec = pow(max(dot(N, H), 0.0), 3.5) * 0.055 * den;
+
+  // Fluid tint (deep ink blue)
+  vec3 fluid = vec3(0.04, 0.10, 0.28);
+
+  // Tree always shows through — blend is capped at 0.72 so minimum 28% tree
+  vec3 color = mix(bg, fluid, clamp(den * 1.35, 0.0, 0.72));
+  color += spec * vec3(0.65, 0.85, 1.0);
+
+  fragColor = vec4(color, 1.0);
+}`;
+
+// ─── GL HELPERS ──────────────────────────────────────────────────────────────
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    console.error('Shader error:', gl.getShaderInfoLog(s), '\n', src);
+  return s;
+}
+
+function makeProgram(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compileShader(gl.VERTEX_SHADER,   vs));
+  gl.attachShader(p, compileShader(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    console.error('Link error:', gl.getProgramInfoLog(p));
+  // Cache uniform locations
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  p.u = {};
+  for (let i = 0; i < n; i++) {
+    const name = gl.getActiveUniform(p, i).name;
+    p.u[name] = gl.getUniformLocation(p, name);
+  }
+  return p;
+}
+
+function makeFBO(w, h) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  
+  // Use RGBA16F if available, otherwise fall back to standard RGBA
+  if (extColorBufferFloat) {
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+  } else {
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  }
+
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  
+  // Check framebuffer completeness
+  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (status !== gl.FRAMEBUFFER_COMPLETE) {
+    console.warn('Framebuffer incomplete:', status);
+  }
+  
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { tex, fbo };
+}
+
+function makeDoubleFBO(w, h) {
+  let a = makeFBO(w, h), b = makeFBO(w, h);
+  return {
+    get read()  { return a; },
+    get write() { return b; },
+    swap() { [a, b] = [b, a]; }
+  };
+}
+
+// Full-screen quad
+const quadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER,
+  new Float32Array([-1,-1,  -1,1,  1,1,  1,-1]), gl.STATIC_DRAW);
+
+function blit(targetFBO) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, targetFBO ?? null);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(0);
+  gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
+}
+
+// Bind a texture to a texture unit and return the unit index
+function bind(unit, tex) {
+  gl.activeTexture(gl.TEXTURE0 + unit);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  return unit;
+}
+
+// ─── FLUID BUFFERS ───────────────────────────────────────────────────────────
+const velocity   = makeDoubleFBO(SW, SH);
+const density    = makeDoubleFBO(SW, SH);
+const divergence = makeFBO(SW, SH);
+const pressure   = makeDoubleFBO(SW, SH);
+
+// Background texture (updated every frame with the tree canvas)
+const bgTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, bgTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+// ─── PROGRAMS ────────────────────────────────────────────────────────────────
+const pAdvect   = makeProgram(VS, FS_ADVECT);
+const pDiv      = makeProgram(VS, FS_DIV);
+const pPressure = makeProgram(VS, FS_PRESSURE);
+const pGrad     = makeProgram(VS, FS_GRAD);
+const pSplat    = makeProgram(VS, FS_SPLAT);
+const pDisplay  = makeProgram(VS, FS_DISPLAY);
+
+// ─── OFFSCREEN TREE CANVAS ───────────────────────────────────────────────────
+const offCanvas = document.createElement('canvas');
+offCanvas.width  = W;
+offCanvas.height = H;
+const offCtx = offCanvas.getContext('2d');
+
+// Draw a recursive tree.
+// `t` drives the sway — each depth level gets a phase-offset so branches
+// don't all move together (gives a more organic feel).
+function drawBranch(ctx, x, y, len, angle, depth, t) {
+  if (depth <= 0 || len < 5) return;
+
+  // Gentle sinusoidal sway — tip branches move more than trunk
+  const sway    = Math.sin(t * 0.9 + depth * 0.7) * 0.09 * (1.0 - depth / 12);
+  const a       = angle + sway;
+  const ex      = x + len * Math.cos(a);
+  const ey      = y + len * Math.sin(a);
+
+  // Trunk = dark warm brown; upper branches = cooler green-grey
+  const warmth  = depth / 10;                     // 1 near trunk, 0 at tips
+  const r       = Math.round(30  + warmth * 30);
+  const g       = Math.round(55  + warmth * 25);
+  const bCh     = Math.round(25  + warmth * 10);
+  ctx.strokeStyle = `rgb(${r},${g},${bCh})`;
+  ctx.lineWidth   = Math.max(0.8, depth * 1.1);
+  ctx.lineCap     = 'round';
+
+  ctx.beginPath();
+  ctx.moveTo(x,  y);
+  ctx.lineTo(ex, ey);
+  ctx.stroke();
+
+  const nextLen = len * 0.695;
+  const spread  = 0.38 + Math.sin(t * 0.4 + depth) * 0.03;
+
+  drawBranch(ctx, ex, ey, nextLen, a - spread, depth - 1, t);
+  drawBranch(ctx, ex, ey, nextLen, a + spread, depth - 1, t);
+}
+
+function renderTree(t) {
+  // Dark, slightly warm background (not pure black so the tree reads well)
+  offCtx.fillStyle = '#080b0f';
+  offCtx.fillRect(0, 0, W, H);
+
+  // One tree centred at the bottom third — trunk pointing straight up
+  drawBranch(offCtx,
+    W * 0.5, H * 0.88,   // root position
+    H * 0.16,             // initial branch length (~16% of height)
+    -Math.PI / 2,         // pointing straight up
+    10,                   // recursion depth
+    t
+  );
+
+  // Upload the offscreen canvas as the background texture.
+  // UNPACK_FLIP_Y aligns the canvas Y-axis (top-down) with GL's (bottom-up).
+  gl.bindTexture(gl.TEXTURE_2D, bgTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, offCanvas);
+}
+
+// ─── AUTO WIND SPLATS ────────────────────────────────────────────────────────
+// Instead of mouse interaction, we emit periodic "wind gusts" across the tree.
+// This drives the fluid and makes the painterly effect visible from the start.
+
+let splatTimer = 0;
+let windPhase  = 0;
+
+function doSplat(nx, ny, vx, vy) {
+  gl.useProgram(pSplat);
+  gl.viewport(0, 0, SW, SH);
+  gl.uniform2f(pSplat.u.uTexel,  1/SW, 1/SH);
+  gl.uniform1f(pSplat.u.uAspect, W / H);
+  gl.uniform2f(pSplat.u.uPoint,  nx, ny);
+  gl.uniform1f(pSplat.u.uRadius, 0.0028);
+
+  // Velocity splat
+  gl.uniform1i(pSplat.u.uTarget, bind(0, velocity.read.tex));
+  gl.uniform3f(pSplat.u.uColor,  vx, vy, 0.0);
+  blit(velocity.write.fbo);
+  velocity.swap();
+
+  // Density splat (the "ink" that makes the fluid visible)
+  gl.uniform1i(pSplat.u.uTarget, bind(0, density.read.tex));
+  gl.uniform3f(pSplat.u.uColor,  1.0, 1.0, 1.0);
+  blit(density.write.fbo);
+  density.swap();
+}
+
+function emitWind(dt) {
+  splatTimer += dt;
+  windPhase  += dt * 0.4;
+
+  // Emit a cluster of splats every ~0.55 s to simulate a gust across the tree
+  if (splatTimer < 0.55) return;
+  splatTimer = 0;
+
+  // Vary the splat y-position so gusts hit different parts of the crown
+  const baseY  = 0.35 + Math.sin(windPhase) * 0.22;
+  const windVx = 380 + Math.sin(windPhase * 1.7) * 120;
+  const windVy = -60  + Math.cos(windPhase * 2.3) * 80;
+
+  for (let i = 0; i < 4; i++) {
+    const nx = 0.05 + i * 0.12 + Math.sin(windPhase + i) * 0.04;
+    const ny = baseY + Math.sin(windPhase * 2.1 + i * 1.1) * 0.10;
+    doSplat(nx, ny, windVx, windVy);
+  }
+}
+
+// ─── FLUID STEP ──────────────────────────────────────────────────────────────
+
+function fluidStep(dt) {
+  gl.viewport(0, 0, SW, SH);
+
+  // 1. Advect velocity (self-advection — velocity carries itself)
+  gl.useProgram(pAdvect);
+  gl.uniform2f(pAdvect.u.uTexel, 1/SW, 1/SH);
+  gl.uniform1f(pAdvect.u.uDt,    dt);
+  gl.uniform1f(pAdvect.u.uDiss,  0.94);
+  gl.uniform1i(pAdvect.u.uVel,   bind(0, velocity.read.tex));
+  gl.uniform1i(pAdvect.u.uSrc,   bind(1, velocity.read.tex));
+  blit(velocity.write.fbo);
+  velocity.swap();
+
+  // 2. Advect density (ink riding the flow)
+  gl.uniform1f(pAdvect.u.uDiss, 0.986);
+  gl.uniform1i(pAdvect.u.uVel,  bind(0, velocity.read.tex));
+  gl.uniform1i(pAdvect.u.uSrc,  bind(1, density.read.tex));
+  blit(density.write.fbo);
+  density.swap();
+
+  // 3. Divergence
+  gl.useProgram(pDiv);
+  gl.uniform2f(pDiv.u.uTexel, 1/SW, 1/SH);
+  gl.uniform1i(pDiv.u.uVel,   bind(0, velocity.read.tex));
+  blit(divergence.fbo);
+
+  // 4. Pressure solve (Jacobi, 22 iterations — enough for a clean field)
+  gl.useProgram(pPressure);
+  gl.uniform2f(pPressure.u.uTexel, 1/SW, 1/SH);
+  gl.uniform1i(pPressure.u.uDiv,   bind(0, divergence.tex));
+  for (let i = 0; i < 22; i++) {
+    gl.uniform1i(pPressure.u.uPressure, bind(1, pressure.read.tex));
+    blit(pressure.write.fbo);
+    pressure.swap();
+  }
+
+  // 5. Gradient subtract → divergence-free velocity
+  gl.useProgram(pGrad);
+  gl.uniform2f(pGrad.u.uTexel,   1/SW, 1/SH);
+  gl.uniform1i(pGrad.u.uPressure, bind(0, pressure.read.tex));
+  gl.uniform1i(pGrad.u.uVel,      bind(1, velocity.read.tex));
+  blit(velocity.write.fbo);
+  velocity.swap();
+}
+
+// ─── MAIN LOOP ───────────────────────────────────────────────────────────────
+
+let lastTs = null;
+
+function loop(ts) {
+  if (!lastTs) lastTs = ts;
+  const dt = Math.min((ts - lastTs) / 1000, 0.033); // cap at 33 ms
+  lastTs = ts;
+
+  const t = ts * 0.001;
+
+  // ① Update tree canvas + upload to bgTex
+  renderTree(t);
+
+  // ② Emit wind splats
+  emitWind(dt);
+
+  // ③ Fluid physics
+  fluidStep(dt);
+
+  // ④ Composite: tree + fluid onto the screen
+  gl.viewport(0, 0, W, H);
+  gl.useProgram(pDisplay);
+  gl.uniform2f(pDisplay.u.uTexel,   1/W, 1/H);
+  gl.uniform1i(pDisplay.u.uDensity, bind(0, density.read.tex));
+  gl.uniform1i(pDisplay.u.uBg,      bind(1, bgTex));
+  blit(null);
+
+  requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
