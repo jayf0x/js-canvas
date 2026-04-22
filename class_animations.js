@@ -1,3 +1,5 @@
+// effects-engine and surprisingly performant...
+
 /** Main */
 class Animations {
   constructor({
