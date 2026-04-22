@@ -1,4 +1,3 @@
-// https://github.com/nickyreinert/maze/blob/master/pseudo_maze.mini.html
 const elms = []
 
 function createElm() {
